@@ -40,6 +40,7 @@ protected:
 
 class Connection;
 
+// Listener 是侦听套接字对象
 class Listener : public Fd {
 public:
 
@@ -55,6 +56,7 @@ public:
     static Listener ListenTCP(uint16_t port);
 
 private:
+    //端口号
     uint16_t port_;
 };
 

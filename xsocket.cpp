@@ -5,6 +5,9 @@
 
 
 // 静态变量初始化
+//>注意<: 这个就类似是tcp握手是随机确定的seq
+//>提示<: 这个唯一的作用,就是让我们知道,这是第几个 建立连接成功 并且注册上epoll的fd
+//>提示<: 这玩意没怎么用上
 uint32_t Fd::next_seq_ = 0;
 
 
@@ -45,6 +48,10 @@ Listener::~Listener(){
     close(this->fd_);
 }
 
+/*
+负责: 将侦听套接字的 创建 绑定 一级注册到epoll中
+返回值: 返回一个绑定好的一套的 侦听套接字
+*/
 Listener Listener::ListenTCP(uint16_t port)
 {
     /* 函数说明: int socket(int domain, int type, int protocol)   
@@ -133,7 +140,7 @@ Listener Listener::ListenTCP(uint16_t port)
     + 1. SO_REUSEADDR : 地址复用 ==>  服务器停止后立即重启,且继续使用同一个 ip+port
     + 2. SO_REUSEPORT : 端口复用 ==>  每一个线程拥有自己的 服务器套接字,且可以重复绑定,在套接字上避免了锁的竞争
     ==========================================
-    ==> 1. 地址复用:  
+    ==> 1. 地址复用: 就是 端口不可以复用,端口只能被一个线程使用,但是ip地址是可以重复使用的 
             a. 地址复用的原理
                 ----------------------------------------
                 +这个套接字选项通知内核，如果端口忙，
@@ -183,6 +190,7 @@ Listener Listener::ListenTCP(uint16_t port)
     // F_SETFL  设置给arg描述符状态标志,可以更改的几个标志是： O_APPEND， O_NONBLOCK，O_SYNC和O_ASYNC。
     // 暨 设置该文件描述符为 非阻塞
     //>提问<: 为什么要设置成非阻塞? 因为你的epoll是 ET 模式
+    //     ET模式标配 读取非阻塞文件描述符
     // ===> 争取 尽可能的一次性读完 ,别阻塞在这
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         LOG_ERROR("set set listen fd O_NONBLOCK failed, msg=%s", strerror(errno));
@@ -200,7 +208,8 @@ Listener Listener::ListenTCP(uint16_t port)
         返回值: 
             成功: 返回0
             失败: 返回-1, 并设置errno
-        */
+    就是讲这个fd指定端口+ip
+    */
     if (bind(fd, (sockaddr *)&addr, sizeof(sockaddr_in)) < 0) {
         LOG_ERROR("try bind port [%d] failed, msg=%s", port, strerror(errno));
         exit(-1);
@@ -220,22 +229,37 @@ Listener Listener::ListenTCP(uint16_t port)
         exit(-1);
     }
 
+
+    // 创建一个对象,对对象内的fd进行赋值
     Listener listener;
     listener.FromRawFd(fd);
 
     LOG_INFO("listen %d success...", port);
+
+    
+    //>提示<: 精髓所在 
+    //    将被侦听套接字交给epoll了
+    //    epoll 负责侦听, 这样accept在失败后,直接切出去,下一次进入时,时有epoll通知的
     XFiber::xfiber()->TakeOver(fd);
+    //>提问<: 为什么要返回一个listener对象?
+    //>解答<: 因为listener 只负责包装 fd的相关信息
+    //      最后这个listener 对象交给 listenTCP进行获取信息
     return listener;
 }
 
+//将 张侦听套接字fd 注册到 class FD_ 中
 void Listener::FromRawFd(int fd) {
     this->fd_ = fd;
 }
 
-//>重点<: shared_ptr
+//>重点<: shared_ptr(只能指针,引用计数)
 //>提问<: 为什么要用share_ptr
+//>提示<: 可能会有多个协程fiber对象 在使用同一个 fd 所以引入 引用计数
+//>重点<: 每一个listener 都有一个accept 专门用来和listener 内部的fd(侦听套接字)来建立连接
+//      ==> 如果 accept失败,那么 当前accept协程 交换出cpu,并且 不进入ready_deq, 只有当epoll 通知后,点名唤醒(切换ctx上下文)改accept协程
+//      ==> accept 协程 不上ready_deq 是为了让其他有任务的协程更加高效的运行,一旦epoll触发立即 accept上xfiber
 std::shared_ptr<Connection> Listener::Accept() {
-    XFiber *xfiber = XFiber::xfiber();//获取单例xfiber
+    XFiber *xfiber = XFiber::xfiber();//获取单例xfiber,即 携程调度器
     //死循环 一直accept
     while (true) {
         /*accept函数说明:获得一个连接, 若当前没有连接则 根据 套接字状态 进行判断
@@ -258,9 +282,12 @@ std::shared_ptr<Connection> Listener::Accept() {
             (内核会负责将请求队列中的连接拿到已连接队列中)
            ===> 监听非阻塞 套接字 : 不会阻塞
 
-        >注意<: fd是非阻塞套接字,如果accept监听非阻塞套接字 ,则不会阻塞
+        >注意<: fd是非阻塞套接字,这是因为前面fctl了!
+             如果accept监听非阻塞套接字 ,则不会阻塞
         */
         int client_fd = accept(fd_, nullptr, nullptr);
+        
+        
         // 监听到了链接
         if (client_fd > 0) {
 
@@ -319,7 +346,8 @@ ngal算法开启/不开启
         好像企鹅家就是这么干的。
         lol: ping高了 会丢包, 你操作会有延迟, 而不是直接断掉,只有你网络连接彻底断开时,才会掉线
 */
-            int nodelay = 1;
+
+            int nodelay = 1;// 指针存放选项值得缓冲区
             //>重点<: 禁用ngal算法,允许 小数据包的单独发送, 减少延迟!
             //>提示<: 这里很重要
             if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
@@ -330,10 +358,16 @@ ngal算法开启/不开启
 
             //fd是有效地 ,几把他注册到epoll中去
             xfiber->TakeOver(client_fd);
+            //>注意<: 这里 返回值, 返回了 一个conncetion对象
             return std::shared_ptr<Connection>(new Connection(client_fd));
         }
-        else { //没有监听到链接
-            // ET 模式下 数据彻底读写完成
+        
+        
+        
+        
+        //没有监听到链接
+        else { 
+            //>重点<: ET 模式下 数据彻底读写完成 client_fd也是<-1
             //>提示<: 数据彻底读写完成,也就证明 这个fiber的工作结束了
 
 
@@ -345,16 +379,24 @@ https://blog.csdn.net/weixin_45921256/article/details/104627030?ops_request_misc
 */
             if (errno == EAGAIN) {// tryagain   没有链接可以建立
                 WaitingEvents events;
+                //>注意<: 这个fd_ 是因为 public Fd_
                 events.waiting_fds_r_.push_back(fd_);
                 //>重点<: 没有链接可以建立, 就会立马切出负责建立连接的fiber, 去处理其他的待处理的fiber
                 //>提示<: 被动套接字 一般就只用来 读取数据,所以是读事件类型
+
+                //>提问<: 为什么要在这里 进行注册?
+                //>解答<: 后续的 accept函数 是直接 切出 并不是yield ,
+                    //  ===> 在这里注册,到xfiber调度器中! 可以保证ListenTCP中TakeOver的端口 
+                    //  ===> 在epoll触发时,可以从io_waiting_fiber
+                    //  ===> 中唤醒这个accept
                 xfiber->RegisterWaitingEvents(events); // 单纯的就是为了注册侦听套接字描述符到xfiber中
                 /*>提问<:为什么要 把 侦听被动套接字的(唯一一个侦听协程)切出?
                     ==> 退出该侦听fiber 是为了尽可能的去运行其他fiber
                     ==> 一旦 侦听套接字被触发
                     ==> epoll侦听被动套接字, 被动套接字接收到syn报文时,会触发 epoll
                     ==> 触发 epoll后, epoll 会去找到 对应的 文件描述符(侦听套接字)
-                    ==> 文件描述符 和对应的fiber对象存储在 map中, 这样我们就可以直接获取到对应 fd应该执行的上下文信息了
+                    ==> 文件描述符 和对应的fiber对象存储在 map中, 即 std::pair(fd,fiber_ctx) 
+                    ==> 这样我们就可以直接获取到对应 fd应该执行的上下文信息了
                     ==> 这样 侦听套接字fiber就又可以回来继续运行了
                 */
                 /*>提问<: 此时侦听 协程退出之后,下一次进入时什么情景?
@@ -426,7 +468,7 @@ Connection::Connection(int fd) {
 }
 
 Connection::~Connection() {
-    XFiber::xfiber()->UnregisterFd(fd_);
+    XFiber::xfiber()->UnregisterFd(fd_);// 这里 进行取消注册! 一般是等他自动西沟, 如果是 主动手动西沟的话 ,采用第一版unrefd 比较好,因为最后还会进行收尾工作
     LOG_INFO("close fd[%d]", fd_);
     close(fd_);
     fd_ = -1;
@@ -446,9 +488,14 @@ Connection::~Connection() {
 
 
 /*思考: 如何保证读取数据的完整性?
-    epoll侦听套接字, 没当事件发生,我们就继续执行 读取,直到 彻底读完,这样就保证了读取的完整
+    epoll侦听套接字, 每当事件发生,我们就继续执行 读取,直到 彻底读完,这样就保证了读取的完整
+
+返回值: 引用计数的一个connection对象,这样fiber 一旦被accept成功之后,accetp返回的connection对象 就可以进行 读写
+    同事如果多个协程操作同一个connection对象 也可以 操作相同的套接字    
 */
 std::shared_ptr<Connection> Connection::ConnectTCP(const char *ipv4, uint16_t port) {
+    
+    // 套接字创建and先关信息填写
     int fd = socket(AF_INET,SOCK_STREAM, 0);
  
     struct sockaddr_in svr_addr;
@@ -465,7 +512,7 @@ std::shared_ptr<Connection> Connection::ConnectTCP(const char *ipv4, uint16_t po
     }
 
     int nodelay = 1;
-    //能用ngal算法
+    //禁用ngal算法
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
         LOG_ERROR("try set TCP_NODELAY failed, msg=%s", strerror(errno));
         close(fd);
@@ -498,10 +545,13 @@ std::shared_ptr<Connection> Connection::ConnectTCP(const char *ipv4, uint16_t po
                     此时epoll被触发,epoll_wait + 出参 event + map
                     我们就可以明确地知道我们该调用哪个协程
                     ==> 这样就可以保证 没有写完的 协程,继续书写
+    
 */
 ssize_t Connection::Write(const char *buf, size_t sz, int timeout_ms) const {
     size_t write_bytes = 0;
-    //获取线程内单例xfiber
+    //获取线程内单例xfiber ,
+    // thread_local 保证了 每一个线程/协程 内部拥有的都是一份拷贝
+    //>提问<: 为什么 又创建了 一个xfiber对象? 不会重复吗? thread_local关键字 
     XFiber *xfiber = XFiber::xfiber();
     // 是否设置有超时时间: 有则计算出死线
     int64_t expire_at = timeout_ms > 0 ? util::NowMs() + timeout_ms : -1;
@@ -533,6 +583,7 @@ ssize_t Connection::Write(const char *buf, size_t sz, int timeout_ms) const {
             LOG_INFO("write to fd[%d] return 0 byte, peer has closed", fd_);
             return 0;
         }
+        // ET模式下一次性写入失败: 缓冲区写满了
         else {
             //有超时时间 , 并且当前时间 > 死线 暨已经超时
             if (expire_at > 0 && util::NowMs() >= expire_at) {
@@ -550,10 +601,19 @@ ssize_t Connection::Write(const char *buf, size_t sz, int timeout_ms) const {
                 WaitingEvents events;
                 events.expire_at_ = expire_at;
                 events.waiting_fds_w_.push_back(fd_);
+
+
                 // 缓冲区写满了. 需要把当前这个fd重新注册回xfiber调度器
+                /*
+                    >提示<: 当前这个fd是非阻塞的,是我们 刚刚写满了 ,但是还需要继续写的fd
+                        我们只能等待 这个fd里面数据被接受掉继续写
+                        这样,我们就需要关注这个fd的状态, 
+                        so: 把他交给epoll
+                */
                 xfiber->RegisterWaitingEvents(events);
+
                 //缓冲区写满, 则切换当前fiber 出去 干别的事情, 等待缓冲区有空间里 在由epoll来进行通知
-                //>提问<: ET模式下 如何通知第二次?  epoll注册后,会一直监听被注册的fd,直到你取消注册
+                //>提问<: ET模式下 如何通知第二次?  epoll注册后,会一直监听被注册的fd,直到你手动取消注册
                 //>提问<: ET模式下 触发一次后,还需要重新注册到epoll中去吗? 不需要,除非你手动取消注册
                 xfiber->SwitchToScheduler();
             }
@@ -566,6 +626,7 @@ ssize_t Connection::Write(const char *buf, size_t sz, int timeout_ms) const {
     return sz;
 }
 
+// timeout_ms:超时时间
 ssize_t Connection::Read(char *buf, size_t sz, int timeout_ms) const {
     XFiber *xfiber = XFiber::xfiber();
     int64_t expire_at = timeout_ms > 0 ? util::NowMs() + timeout_ms : -1;
@@ -612,18 +673,21 @@ ssize_t Connection::Read(char *buf, size_t sz, int timeout_ms) const {
             return 0;
         }
         else {
+            // 超时
             if (expire_at > 0 && util::NowMs() >= expire_at) {
                 LOG_WARNING("read from fd[%d] timeout after wait %dms", fd_, timeout_ms);
                 return 0;
             }
+            //陷入系统调用
             if (errno != EAGAIN && errno != EINTR) {
                 LOG_DEBUG("read from fd[%d] failed, msg=%s", fd_, strerror(errno))
                 return -1;
             }
+            // 数据读取完毕 ET非阻塞
             else if (errno == EAGAIN) { // 数据读取完毕: ET模式下非阻塞套接字,没有比必要继续等,这段时间要充分利用
                 LOG_DEBUG("read from fd[%d] return EAGIN, add into waiting/expire events with expire at %ld  and switch to sched", fd_, expire_at);
                 WaitingEvents events;
-                events.expire_at_ = expire_at;
+                events.expire_at_ = expire_at;// 超时时间
                 events.waiting_fds_r_.push_back(fd_);
                 //把当前的fd注册到xfiber中去
                 //>提问<: 仔细想想? 这里和上边的几个注册,都只是单纯的 注册fd吗?
@@ -639,7 +703,7 @@ ssize_t Connection::Read(char *buf, size_t sz, int timeout_ms) const {
                     4. 在xfiber调度外壳的调度下,当前fiber 是先将自己 注册到xfiber中去,
                     5. 然后再进行切换 ===>registerwaitingevents内部 会使用cur_dispatch_fiber 作为被存储的fiber对象
                 */
-                
+                // 数据读取完毕,但是非阻塞 后续还有, 就继续将这个时间注册到epoll中,一旦对应fd 有数据来了 立马处理
                 xfiber->RegisterWaitingEvents(events);
                 xfiber->SwitchToScheduler();
             }
