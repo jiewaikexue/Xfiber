@@ -14,11 +14,70 @@
 #include "util.h"
 
 typedef enum {
-    INIT = 0,
-    READYING = 1,
-    WAITING = 2,
-    FINISHED= 3
+    INIT = 0, //初始化
+    READYING = 1,//准备
+    WAITING = 2,//等待
+    FINISHED= 3 //结束
 }FiberStatus;
+
+
+// 这里是信号量
+//>重点<: 为什么 需要信号量? 
+//>提示<: 有时候 协程之间也是需要进行同步的 ==> 小心协程间为了获取资源引发死锁
+struct Sem {
+
+	//>注意<: thread_local: 确保每一个县城里面 只有一个sem_seq
+    //>提问<: 为什么需要这个sem_seq?
+    //>解答<: 单线程内全局的信号量, 为了统计 总共有多少个 已经申请了的信号量
+    thread_local static int64_t sem_seq;
+
+    int64_t seq_; //表示 这是全局第几个信号量,即sem的编号
+
+    Sem(int32_t value);
+
+    //>功能<: 信号量申请接口
+    bool Acquire(int32_t apply_value, int32_t timeout_ms=-1);
+
+    //>功能<: 信号量释放
+    void Release(int32_t acquired_value);
+
+    //>提示<: 比较两个信号量内部 信号量的多少
+    //>提问<: sem 可以当做map内部的kep 来进行排序 
+    bool operator < (const Sem &other) const {
+        return seq_ < other.seq_;
+    }
+};
+
+    //>注意<: 这里是 fiber的事件集合
+    //>提示<: 每一个fiber 内部都有一个该结构, 该结构 内超时时间,负责该fiber生存周期
+struct WaitingEvents {
+        WaitingEvents() {
+        expire_at_ = -1;
+        }
+        void Reset() {
+            expire_at_ = -1;
+            waiting_fds_r_.clear();
+            waiting_fds_w_.clear();
+        }
+
+        // 一个协程中监听的fd不会太多，所以直接用数组   
+        //fiber的waitingevents 管理 这个fiber下 处理的读写fd 以及信号量
+
+        // 被监听的 读事件 fd数组
+        //>提问<: 为什么使用数组? 如果epoll将多个事件 指向一个协程, 那么改协程 也是可以 通过epoll_wait区分到底是谁触发,然后在从内部甄选出处理对象
+        std::vector<int> waiting_fds_r_;
+        // 被坚挺的 写事件 的 fd数组
+        std::vector<int> waiting_fds_w_;
+        // 被监听的 Sem数组,Sem可以利用semmap 进行和seminfo的映射
+        std::vector<Sem> waiting_sems_;
+        //fiber的超时时间
+    
+        // 超时时间 是针对整个 fiber的 : 即整个协程的diedline，
+        //>提问<:  超时后 fiber立即死亡吗? 
+        //>提示<: 不! fiber 需要对没有完成的工作进行 最后一步的收尾 
+        //>重点<: 一旦超时, 整个fiber失效, 同时 信号量 fd也全都不用管了 
+        int64_t expire_at_;
+};
 
 
 
@@ -26,57 +85,12 @@ typedef enum {
 typedef ucontext_t XFiberCtx;
 
 //>注意<:交换上下文的本质 就是 交换ctx
-#define SwitchCtx(from, to) swapcontext(from, to)
-
-// 这里是信号量
-struct Sem {
-
-	//>注意<: thread_local: 确保每一个县城里面 只有一个sem_seq
-    thread_local static int64_t sem_seq;
-
-    int64_t seq_;
-
-    Sem(int32_t value);
-
-    bool Acquire(int32_t apply_value, int32_t timeout_ms=-1);
-
-    void Release(int32_t acquired_value);
-
-    bool operator < (const Sem &other) const {
-        return seq_ < other.seq_;
-    }
-};
-
-
-//>注意<: 这里是 fiber的事件集合
-struct WaitingEvents {
-    WaitingEvents() {
-        expire_at_ = -1;
-    }
-    void Reset() {
-        expire_at_ = -1;
-        waiting_fds_r_.clear();
-        waiting_fds_w_.clear();
-    }
-
-    // 一个协程中监听的fd不会太多，所以直接用数组
+#define SwitchCtx(from, to) \
+     swapcontext(from, to)
 
 
 
-    //fiber的waitingevents 管理 这个fiber下 处理的读写fd 以及信号量
 
-    // 被监听的 读事件 fd数组
-    std::vector<int> waiting_fds_r_;
-    // 被坚挺的 写事件 的 fd数组
-    std::vector<int> waiting_fds_w_;
-    // 被监听的 信号量数组
-    std::vector<Sem> waiting_sems_;
-    //fiber的超时时间
-    
-    // 超时时间 是针对整个 fiber的 
-    //>重点<: 一旦超时, 整个fiber失效, 同时 信号量 fd也全都不用管了 
-    int64_t expire_at_;
-};
 
 
 class Fiber;
@@ -104,30 +118,53 @@ public:
     //>解答<: 暨 当前fiber对象(协程)没有运行完毕,自己主动让出cpu
     //>注意<: yield 之后 正在运行的协程,让出cpu之后 ,`cpu会回到主调度协程, 暨xfiber调度器的 dispatch方法
     //>提示<: 如何实现回到xfiber.dispatch? 依靠ucontext函数簇, 保证每一个fiber对象(协程) 的后续上下文都是 xfiber对象
+    //>重点<: Yield 和 SwitchToScheduler 的区别
+        // 1. SwitchToScheduler 是Yield 的子调用
     void Yield();
 
     //>提问<: 此函数和Yield有何区别?
     //>解答<: Yield 函数, 主动让出cpu后,让出cpu的原主人, 还有存在意义, 主动切出后仍然是ready状态
-    //      而 switchtoschedfiber 只是单纯的让出cpu,
-    //>重点<: 当前正在运行的 协程(fiber对象), 让出cpu, 去执行xfiber调度器的 dispatch上下文
-    //>重点<: Yield 的子调用
+    //      而 switchtoschedfiber 只是单纯的让出cpu,    //>重点<: 当前正在运行的 协程(fiber对象), 让出cpu, 去执行xfiber调度器的 dispatch上下文
+    //>重点<: 区别:
+    //       1. Yield 的子调用
+    //       2. SwitchToScheduler 不会吧fiber协程对象 加入到ready_deq中
+    //           ==> 即: 该协程 不会在就绪队里里面 被唤醒,只能被主动的 指名 唤醒
+    //           ==> 作用: 当前fiber是最后一次运行时,利用该函数进行切换
     void SwitchToScheduler();
 
-
+// ==================================================
+    //功能: 将事件集合 注册给对应fiber对象
     //>注意<: 将当前 文件描述符fd 以及 当前的fiber对象(正在cpu上运行,也就是当前正在运行的协程本身的上下文信息)
     //      打包为一个整体,注册到xfiber调度器中
     //>提问<: 为什么要这样做? 
     //>解答<: 
-    void RegisterWaitingEvents(WaitingEvents &events);
-    
-    //>注意<: 把fd从xfiber中移除 
+    //>注意<:待修改
+    // void RegisterWaitingEvents(WaitingEvents &events);
+
+    //>注意<: 把fd从xfiber/fiber中移除 
     //>提问<: 为什么需要这样做?
     //>解答<:  一个套接字fd已经彻底关闭, 暨 不会再有数据的读写
     //     此时我们需要把 fiber对象以及该fd 从map中移除,并且fiber对象要删除
-    bool UnregisterFdFromScheduler(int fd);
+    // bool UnregisterFdFromScheduler(int fd);
+// ===================================================
 
 
 
+    //>注意<: 功能: 将fd注册上调度器
+    //步骤: 1.检查是否存在于epoll监听的map映射中 io_waiting_events 
+    //    2. 如果有 则重新更新映射 关系 
+    //    3. 如果没有 则新增到 epoll的map映射中去, 并添在epoll红黑树种注册
+    //    最后 在设置fiber 的超时时间
+    bool RegisterFdWithCurrFiber(int fd, int64_t expired_at, bool is_write);
+
+    //>注意<: 把fd从xfiber/fiber中移除 
+    //>提问<: 为什么需要这样做?
+    //>解答<:  一个套接字fd已经彻底关闭, 暨 不会再有数据的读写
+    //     此时我们需要: 解除映射关系,epoll取消监听 最后进行收尾工作 fiber进行析构
+    bool UnregisterFd(int fd);
+
+
+    void RegisterWaitingEvents(WaitingEvents &events);
 
 
 
@@ -136,7 +173,7 @@ public:
     //>重点<: thread_local and 单线程内 多携程的情况下实现 单例
     //>提问<: 为什么要这样做?
     //>解答<: 设计目的
-        //1.使得 单线程内多携程的情况下, xfiber对象 暨协程调度器 是单例
+        //1. 使得 单线程内多携程的情况下, xfiber对象 暨协程调度器 是单例
         //2. 如果是多线程的环境下 , 每一个线程内部 可能有很多个协程, 
         //  每一个线程内 有且只有一个协程调度器,且协程调度器之间彼此互不影响
 
@@ -154,6 +191,10 @@ public:
         thread_local: 基本上所有类型都可以用
 
     */ 
+    /*这个可不是构造函数
+        xf 只初始化一次
+    */
+    //>重点<: 你可能会在后面看到很多次xfiber()的调用,但是只执行/初始化一次
     static XFiber * xfiber()
     {
         static thread_local XFiber xf;
@@ -165,6 +206,7 @@ public:
 
 
     //>注意<: 一定需要该函数, 我们需要获取到 xfiber调度类的上下文信息,来进行保存
+    //>注意<: 这里保存的 是 主线程(主协成/xfiber)的上下文信息 (调度器 一直轮转)
     //>重点<: 有了存根, 就可以在子协程 回到调度协程时,才有家可归
     // ucontext_t * Get_X_Fiber_Ctx();
 	XFiberCtx * SchedCtx();
@@ -174,8 +216,7 @@ public:
 
     //>注意<:将某个fd注册到epoll中去
     void TakeOver(int fd);
-    //>注意<: 将某个函数从epoll中取消注册
-    bool UnregisterFd(int fd);
+
 
     //>注意<: 计算并设置超时时间(死线)
     void SleepMs(int ms);
@@ -189,8 +230,13 @@ public:
 	//>注意<: 信号量  取消注册
     void UnregisterSem(Sem *sem);
 
+    //功能: 当前fiber尝试获取sem
 	//>注意<: 信号量 尝试获取
-    bool TryAcquireSem(Sem *sem, int32_t value);
+    //>注意<: 尝试获取信号量
+    //>重点<: 为什么叫做尝试? 如何尝试
+    //>提示<: 如果可以申请,那就申请,如果sem内部不够,就不申请 
+    //>注意<: 不需要在这里处理 SemINfo内部的等待fiber队列, 因为这里已经是有明确的fiber要获取信号量
+    int32_t TryAcquireSem(Sem *sem, int32_t value);
 
     // release和restore的区别
     // restore时是可申请的
@@ -223,7 +269,10 @@ private:
     //>提问<: 为什么使用deque ? list 不行吗
     //>解答<: list可以 deque更好
     //  list 和deque 在扩容时 deque更好一点
-    //>重点<:  待补充 
+    //>重点<:  全局总共有3~4个队列:
+    //     等待队列 运行队列 超时队列 信号量队列
+    //     超市队列: std::map<int, set<fiber*,fiber *>> XFiber::expire_events 存储超时 事件 和对应的fiber
+    //     epoll 监听映射关系: std::map<int, XFiber::WaitingFibers> XFiber::io_waiting_fibers_ 存储 fd 和对应 的等待 读fiber/写fiber
     std::deque<Fiber *> ready_fibers_;
     std::deque<Fiber *> running_fibers_;
 
@@ -231,21 +280,27 @@ private:
     //>提问<: 为什么需要保存这个fiber对象?
     //>解答<: xfiber调度器调度fiber对象后, 如果fiber对象,yield让出cpu,之后 xfiber调度器,回归后,还可以通过该变量
         //  来掌握 到底是谁让出cpu了
-    //>注意<: 期待后续详细解释
+    //>注意<: 原名: curr_fiber_
     Fiber * cur_dispatch_fiber_;
 
     //>提示<: xfiber调度器当上下文信息
     ucontext_t sched_ctx_;
 
-
+    //>提示<: 功能: std::map<int, XFiber::WaitingFibers> XFiber::io_waiting_fibers_ 即epoll 触发fd对应的 映射!
     //>注意<: 此结构体设计用意:
-    //>重点<: 我们是使用epoll 来监听fd,被监听的fd和 fd对应的 协程 存在了map中
+    //>重点<: 我们是使用epoll 来监听fd的,
+        // 一个fd 会被一个fiber 负责
+        // 一个fd 可能会有两种情况:可读可写
+        // 产生映射: std::map<int, XFiber::WaitingFibers> XFiber::io_waiting_fibers_
+        //      即: fd ---> 读fiber/写fiber 
+        //       读or写fiber 内部 fiber.waiting_events 状态 超时时间,读fd数组,写fd数组 
         // 一个 fd 可能对应 一个  可读事件和  一个可写事件
         // 暨 key1= pair(int fd, fiber * w_);
         //   key2= pair(int fd, fiber * r_);
 
 	struct WaitingFibers {
         Fiber *r_, *w_;
+        // 参数: r:负责读的fiber w: 负责写的fiber
         WaitingFibers(Fiber *r = nullptr, Fiber *w = nullptr) {
             r_ = r;
             w_ = w;
@@ -253,36 +308,51 @@ private:
     };
 
 
-	//>注意<: 信号量结构体
+	//>注意<: 信号量相关信息结构体
 	struct SemInfo {
         SemInfo(int32_t value = 0) {
             value_ = value;
-            acquiring_fiber_ = nullptr;
-            acquired_value_ = 0;
+            UCBA_fiber_ = nullptr;
+            UCBA_value_ = 0;
             fibers_.clear();
         }
 
-        int32_t value_; 
-        // 正在尝试获取的fiber
-        Fiber *acquiring_fiber_;
-        // 正在尝试获取的value_
-        int32_t acquired_value_;
-        std::set<Fiber *> fibers_;
+        int32_t value_; //可以使用的信号量个数
+
+
+        //>提示<: 串行化了, 基本上不会发生死锁
+
+        //>注意<: Unassigned_completion_but_acquireed_value_,即 当前Sem信号量持有的剩余个数,不足以彻底满足Fiber对象所需要,但是 还是把这些信号量全部给Fiber对象了
+        //Sem把自己の全部都分配给某一个Fiber对象 的 没有满足他胃口的 信号量个数
+        int32_t UCBA_value_;
+
+        //>注意<: 本变量指代: Sem信号量 将自己剩余全部,都分给某个特定的Fiber 
+        //>提示<: 为什么需要这样? 只有这样,在下一次 Sem再一次进行信号量分配时,先检查,是否有没有彻底分配完成的fiber ,如果有先给这个fiber分配, 避免饿死
+        Fiber *UCBA_fiber_; 
+
+        std::set<Fiber *> fibers_; // 等待协程集合: 如果有多个协程同时申请信号量,其他的协程,会在这里等待
     };
 
     
-    //>提问<: 会不会出现一个fd的读/写被多个协程监听？协程只负责 处理,epoll负责监听
-    //>解答<: 不会！为什么? epoll 监听到时见发生,会立即将他出队,然后交给对应协程处理
-    //>注意<: 一个fiber也不可能会监听多个fd
+    // 功能: epoll 监听fd 和对应fiber 对象 的映射关系
+    //>提问<: 会不会出现一个fd的读/写被多个协程负责？协程只负责 处理,epoll负责监听
+    //>解答<: 一般不会！为什么? epoll 监听到时见发生,会立即将他出队(epoll内部监听树 不会的下树,epoll_wait 扫描的是就绪链表rdlist,检测rdlist里面是否有就绪的epitem),
+    //      然后交给对应协程处理
+    //>注意<: 一个fiber可能会处理多个fd: fiber.waiting_events 内部是一个fd数组
     //>重点<: 一个连接由一个协程处理
     //>重点<: 但是一个 协程 可能会处理多个fd(链接)
 
 	//>提问<: 为什么使用map?
 	//>解答<: 1.fd是有序的,fd基本上是不可能重复的
 	//	   2. 所以: 有序+无重复,基本上就是红黑树了
+    //>注意<: 这个map 就是全局等待队列
+    // 基本映射关系: fd--->wait_fiber|r_fiber|w_fiber --> wait_events
     std::map<int,WaitingFibers> io_waiting_fibers_;
 	
-	//===============================================================
+ 
+
+
+ 
 	//>注意<: 超时队列 
     // 也用红黑树,因为后面需要begin
     //>重点<: 超时队列的作用:
@@ -298,7 +368,7 @@ private:
     // 已经结束的 fiber数组
     std::vector<Fiber *> finished_fibers_;
 
-    // 信号量集合
+    // xfiber内部维护信号量映射关系: sem结构体 和Seminfo的映射, 每一个sem 对应一个seminfo
     std::map<Sem, SemInfo> sem_infos_;
 	//===============================================================
 
@@ -307,13 +377,30 @@ private:
     
 
 class Fiber {
+public://结构体
+    struct FdEvent
+	{
+		int fd_;
+		int64_t expired_at_;
+		FdEvent(int fd = -1,int64_t expired_at = -1) {
+		    if (expired_at <= 0) {
+                expired_at = -1;
+            }
+            fd_ = fd;
+            expired_at_ = expired_at;
+		}
+	};
 public:
-    //>注意<: 这点我不懂
+    //>注意<: 参数是个仿函数: 即传入的是 fiber 经过ucontest函数簇 调度上cpu之后的入口函数
+    // xfiber: 主调度器
+    // stack_size: 协程栈空间大小 
+    // fiber_name: 协程名称
     Fiber(std::function<void ()> run,XFiber * xfiber,size_t stack_size,std::string fiber_name);
     
     ~Fiber();
 
     //源名 Ctx
+    // 功能: 获取当前fiber 协程上下文并返回
     ucontext_t * Get_Fiber_Ctx();
     
     std::string Name();
@@ -330,25 +417,29 @@ public:
     //>提问<: 参数是什么? 参数就是fiber对象,fiber对象就是协程
     static void Start(Fiber * fiber);
 
-
-	struct FdEvent
-	{
-		int fd_;
-		int64_t expired_at_;
-		FdEvent(int fd = -1,int64_t expired_at = -1) {
-		    if (expired_at <= 0) {
-                expired_at = -1;
-            }
-            fd_ = fd;
-            expired_at_ = expired_at;
-		}
-	};
-	//>注意<: 获取等待事件集合
+    // struct WaitingEvents; //结构体声明
+	//>注意<: 获取当前fiber的等待事件集合
 	WaitingEvents &GetWaitingEvents() {
         return waiting_events_;
     }
-	//>注意<: 设置等待事件集合
-	void SetWaitingEvent(const WaitingEvents &events);
+    
+    //>注意<: 分别设置 对应fd+超时时间 的 读事件/写事件 对应的fiber --> 挂上
+    void SetReadEvent(const WaitingEvents &events) {
+        for (size_t i = 0; i < events.waiting_fds_r_.size(); i++) {
+            waiting_events_.waiting_fds_r_.push_back(events.waiting_fds_r_[i]);
+        }
+    }
+
+    void SetWriteEvent(const WaitingEvents &events) {
+            for (size_t i = 0; i < events.waiting_fds_r_.size(); i++) {
+        waiting_events_.waiting_fds_r_.push_back(events.waiting_fds_r_[i]);
+        }     
+    }
+    void SetExpireEvent(const WaitingEvents &events) {
+        if (events.expire_at_ > 0) {
+            waiting_events_.expire_at_ = events.expire_at_;
+        }
+    }
 
 private:
     //>提问<: seq的作用是什么?为什么需要特地保留
